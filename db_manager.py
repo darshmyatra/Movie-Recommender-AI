@@ -2,30 +2,29 @@ import sqlite3
 import pandas as pd
 import os
 import ast
+import pickle
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 def clean_genres(genre_string):
-    """Safely extracts genre names from the messy string format."""
+    if pd.isna(genre_string):
+        return ""
     try:
-        # Convert string representation of list into an actual Python list of dictionaries
         genre_list = ast.literal_eval(genre_string)
-        # Extract just the 'name' value from each dictionary
-        names = [genre['name'] for genre in genre_list]
-        return names
+        return " ".join([genre['name'] for genre in genre_list if 'name' in genre])
     except:
-        return []
+        return ""
 
 def initialize_database():
     db_filename = "production_movies.db"
     
-    # 1. Wipe old database to ensure a clean slate
     if os.path.exists(db_filename):
         try:
             os.remove(db_filename)
             print(f"Clean slate activated: Removed old '{db_filename}'")
         except PermissionError:
-            print("Warning: Database file is currently locked.")
+            print("Warning: Database file is locked.")
+            return
 
-    # 2. Re-create database and tables
     conn = sqlite3.connect(db_filename)
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON;")
@@ -34,9 +33,8 @@ def initialize_database():
     CREATE TABLE IF NOT EXISTS Movies (
         movie_id INTEGER PRIMARY KEY,
         title TEXT NOT NULL,
-        is_action INTEGER DEFAULT 0,
-        is_comedy INTEGER DEFAULT 0,
-        is_scifi INTEGER DEFAULT 0
+        overview TEXT,
+        genres TEXT
     )
     ''')
 
@@ -50,47 +48,42 @@ def initialize_database():
     )
     ''')
 
-    # 3. PIPELINE: Load and Clean the CSV data
-    print("Loading raw CSV metadata into pipeline...")
-    df_raw = pd.read_csv('movies_metadata.csv')
+    print("Reading massive Kaggle CSV metadata...")
+    df = pd.read_csv('movies_metadata.csv', low_memory=False)
+    df = df.dropna(subset=['id', 'title', 'overview'])
+    df['id'] = pd.to_numeric(df['id'], errors='coerce')
+    df = df.dropna(subset=['id'])
+    df['id'] = df['id'].astype(int)
 
-    # Drop rows where crucial details like ID or Title are missing completely
-    df_clean = df_raw.dropna(subset=['id', 'title']).copy()
+    print("Parsing unstructured text genres...")
+    df['cleaned_genres'] = df['genres'].apply(clean_genres)
 
-    # Process each row and insert it into the database
-    movies_processed = 0
-    for _, row in df_clean.iterrows():
-        try:
-            m_id = int(row['id'])
-            title = row['title']
-            genres = clean_genres(row['genres'])
-            
-            # Map genres to binary flags (1 if present, 0 if not)
-            is_action = 1 if 'Action' in genres else 0
-            is_comedy = 1 if 'Comedy' in genres else 0
-            is_scifi = 1 if 'Science Fiction' in genres else 0
-            
-            cursor.execute('''
-                INSERT OR IGNORE INTO Movies (movie_id, title, is_action, is_comedy, is_scifi)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (m_id, title, is_action, is_comedy, is_scifi))
-            movies_processed += 1
-        except Exception as e:
-            # Skip corrupted rows silently
-            continue
+    df_movies_to_insert = df[['id', 'title', 'overview', 'cleaned_genres']].drop_duplicates(subset=['id'])
+    df_movies_to_insert = df_movies_to_insert.rename(columns={'id': 'movie_id', 'cleaned_genres': 'genres'})
 
-    # 4. Seed user history with real movie IDs now
-    # User 'Darsh' watched Toy Story (862) and Avatar (19995)
-    user_history = [
-        ('Darsh', 862, 4.9),  
-        ('Darsh', 19995, 4.5),  
-        ('Jeet', 12, 5.0)    
-    ]
+    print(f"Streaming {len(df_movies_to_insert)} movies into SQL storage matrix...")
+    df_movies_to_insert.to_sql('Movies', conn, if_exists='append', index=False)
+
+    # Seed watch history
+    user_history = [('Darsh', 862, 5.0), ('Darsh', 19995, 4.8), ('Darsh', 155, 4.9), ('Jeet', 12, 5.0)]
     cursor.executemany("INSERT INTO Watch_History (user_name, movie_id, user_rating) VALUES (?, ?, ?)", user_history)
-    
     conn.commit()
     conn.close()
-    print(f"Pipeline complete! Successfully parsed and loaded {movies_processed} real movies into the database.")
+
+    # ---- NEW PRODUCTION OPTIMIZATION: PRE-COMPUTE VECTORS ----
+    print("Pre-computing TF-IDF NLP vectors for all 44,000+ movies...")
+    tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
+    
+    # Generate vectors across the entire dataset once
+    tfidf_matrix = tfidf.fit_transform(df_movies_to_insert['overview'])
+    
+    print("Saving vectorized mathematical artifacts to disk...")
+    with open("tfidf_model.pkl", "wb") as f:
+        pickle.dump(tfidf, f)
+    with open("tfidf_matrix.pkl", "wb") as f:
+        pickle.dump(tfidf_matrix, f)
+        
+    print("Database scale-up and vector pre-computation complete!")
 
 if __name__ == '__main__':
     initialize_database()
