@@ -1,40 +1,49 @@
 import sqlite3
 import pandas as pd
+import numpy as np  # ADDED: Essential for array data type casting
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-def generate_user_recommendations(target_user):
-    # 1. Open connection to our fresh production database
+def generate_nlp_recommendations(target_user):
+    # 1. Connect to our database and pull the raw movie entries
     conn = sqlite3.connect('production_movies.db')
-
-    # 2. Extract ALL real movies from the database
-    df_all_movies = pd.read_sql_query("SELECT * FROM Movies", conn)
+    df_movies = pd.read_sql_query("SELECT movie_id, title FROM Movies", conn)
     
-    # Isolate the mathematical feature columns for our vector space (the binary flags)
-    features_all = df_all_movies.set_index('title')[['is_action', 'is_comedy', 'is_scifi']]
+    # Read the text descriptions directly from our local CSV data file
+    df_csv = pd.read_csv('movies_metadata.csv').dropna(subset=['id', 'title', 'overview'])
+    df_csv['id'] = df_csv['id'].astype(int)
+    
+    # Merge datasets on the unique ID keys
+    df_merged = pd.merge(df_movies, df_csv, left_on='movie_id', right_on='id', how='inner')
 
-    # 3. Extract target user's specific watch history using an INNER JOIN
-    sql_user_taste = f'''
-    SELECT Movies.is_action, Movies.is_comedy, Movies.is_scifi
-    FROM Watch_History
-    INNER JOIN Movies ON Watch_History.movie_id = Movies.movie_id
-    WHERE Watch_History.user_name = '{target_user}' AND Watch_History.user_rating >= 4.0;
+    # 2. THE NLP ENGINE: Initialize the TF-IDF Vectorizer
+    tfidf = TfidfVectorizer(stop_words='english')
+    tfidf_matrix = tfidf.fit_transform(df_merged['overview'])
+
+    # 3. Pull the target user's favorite movie histories
+    sql_user_history = f'''
+    SELECT movie_id FROM Watch_History 
+    WHERE user_name = '{target_user}' AND user_rating >= 4.0;
     '''
-    df_user_taste = pd.read_sql_query(sql_user_taste, conn)
+    df_history = pd.read_sql_query(sql_user_history, conn)
+    conn.close()
 
-    # Safety valve: If the user doesn't exist or has no high ratings, exit safely
-    if df_user_taste.empty:
-        conn.close()
+    if df_history.empty:
         return None
 
-    # 4. Compute User Taste Vector (Average coordinates of their favorite movie genres)
-    user_taste_vector = df_user_taste.mean().values.reshape(1, -1)
+    # Find the row indices of the movies the user loved
+    favorite_movie_ids = df_history['movie_id'].tolist()
+    user_fav_indices = df_merged[df_merged['movie_id'].isin(favorite_movie_ids)].index
 
-    # 5. Execute Cosine Similarity calculations between User Vector and All Movie Vectors
-    similarity_scores = cosine_similarity(user_taste_vector, features_all)
+    # 4. VECTOR MATH: Calculate average Text Vector and force convert to numpy array
+    # FIX: Wrapped the expression with np.asarray() to resolve the scikit-learn compatibility issue
+    user_text_vector = np.asarray(tfidf_matrix[user_fav_indices].mean(axis=0))
 
-    # 6. Map scores back to the movies, sort them, and return the data pipeline results
-    df_all_movies['Match_Score'] = similarity_scores[0]
-    recommendations = df_all_movies.sort_values(ascending=False, by='Match_Score')
+    # 5. MATRIX MATCHING: Compare user's text taste profile against all movie overviews
+    similarity_scores = cosine_similarity(user_text_vector, tfidf_matrix)
+
+    # 6. Package and sort results
+    df_merged['Match_Score'] = similarity_scores[0]
+    recommendations = df_merged.sort_values(ascending=False, by='Match_Score')
     
-    conn.close()
-    return recommendations[['title', 'Match_Score']]
+    return recommendations[['title_x', 'Match_Score']].rename(columns={'title_x': 'title'})
